@@ -84,24 +84,52 @@ RULES = {
 # ==========================================================
 
 class APIFetcher:
-    """Fetch genres/tags from MusicBrainz and Last.fm."""
+    """Fetch genres/tags from MusicBrainz and Last.fm and cache {tags, country}."""
     def __init__(self, lastfm_key=None, cache_path="api_cache.json"):
         self.lastfm_key = lastfm_key or os.getenv("LASTFM_API_KEY", "")
         self.cache_path = Path(cache_path)
-        self.cache = json.loads(self.cache_path.read_text()) if self.cache_path.exists() else {}
+
+        if self.cache_path.exists():
+            try:
+                text = self.cache_path.read_text(encoding="utf-8").strip()
+                self.cache = json.loads(text) if text else {}
+            except Exception as e:
+                print(f"⚠️ Could not read cache ({e}), starting fresh.")
+                self.cache = {}
+        else:
+            self.cache = {}
 
     def save_cache(self):
-        self.cache_path.write_text(json.dumps(self.cache, indent=2))
+        """Safely save the cache to disk as UTF-8 JSON."""
+        try:
+            self.cache_path.write_text(
+                json.dumps(self.cache, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"⚠️ Could not save cache: {e}")
 
-    def _cache_key(self, artist, track):
-        return f"{artist.lower()}::{track.lower() if track else ''}"
+    # ✅ safer key (artist-only; tolerate NaN)
+    def _cache_key(self, artist, track=None):
+        a = artist.strip().lower() if isinstance(artist, str) else ""
+        return f"{a}::"   # use artist-only key to maximize reuse
 
     def fetch(self, artist, track=None):
         key = self._cache_key(artist, track)
-        if key in self.cache:
-            return self.cache[key]
+
+        # ✅ migration: if old list format, upgrade to dict on the fly
+        cached = self.cache.get(key)
+        if cached is not None:
+            if isinstance(cached, list):
+                upgraded = {"tags": list({t for t in cached if isinstance(t, str)}), "country": ""}
+                self.cache[key] = upgraded
+                self.save_cache()
+                return upgraded
+            # already new format
+            return cached
 
         tags = []
+        country = ""  # ✅ always define
 
         # --- MusicBrainz ---
         try:
@@ -111,37 +139,36 @@ class APIFetcher:
                 data = resp.json()
                 if data.get("artists"):
                     first = data["artists"][0]
-                    country = first.get("country", "")  # + capture country
+                    country = first.get("country", "") or ""
                     if "tags" in first:
-                        tags.extend([t["name"] for t in first["tags"]])
+                        tags.extend([t["name"] for t in first["tags"] if isinstance(t.get("name"), str)])
         except Exception:
-            country = ""  # + ensure defined on exceptions
+            pass  # country stays ""
 
-            pass
-
-        # --- Last.fm ---
-        if self.lastfm_key:
+        # --- Last.fm (no 'country' param for gettoptags) ---
+        if self.lastfm_key and isinstance(artist, str) and artist.strip():
             try:
                 url = "http://ws.audioscrobbler.com/2.0/"
                 params = {
                     "method": "artist.gettoptags",
                     "artist": artist,
-                    "country": country,
                     "api_key": self.lastfm_key,
                     "format": "json"
                 }
                 r = requests.get(url, params=params)
                 if r.status_code == 200:
                     j = r.json()
-                    tags.extend([t["name"] for t in j.get("toptags", {}).get("tag", [])])
+                    tags.extend([t["name"] for t in j.get("toptags", {}).get("tag", []) if isinstance(t.get("name"), str)])
             except Exception:
                 pass
 
-        tags = list(set(tags))
-        self.cache[key] = {"tags": list(set(tags)), "country": country}
+        # ✅ write new-format cache and return dict
+        payload = {"tags": sorted(set(tags)), "country": country}
+        self.cache[key] = payload
         self.save_cache()
-        time.sleep(1.0)  # be polite
-        return tags
+        time.sleep(0.5)  # polite but faster than 1s if you want
+        return payload
+
 
 # ==========================================================
 # 4️⃣  GenreClassifier core
@@ -158,6 +185,9 @@ class GenreClassifier:
         self.umbrella_embs = self.model.encode(self.umbrella, normalize_embeddings=True)
 
         self.manual_map = {}  # user-validated corrections
+
+
+
 
     # ------------------------------------------
     # Text cleaning
@@ -220,41 +250,65 @@ class GenreClassifier:
     # Full pipeline
     # ------------------------------------------
     def classify(self, genre, artist=None, track=None):
-        # 1. Manual map (learned corrections)
+        # 1️⃣ Manual map (learned corrections)
         if genre in self.manual_map:
             return self.manual_map[genre], 1.0
 
-        # 2. Rule-based
+        g_clean = self.clean(genre)
+
+        # 2️⃣ Always check cache (artist-based metadata)
+        country = ""
+        tags = []
+        if isinstance(artist, str) and artist.strip():
+            key = f"{artist.strip().lower()}::"
+            cached = self.api.cache.get(key)
+            if isinstance(cached, dict):
+                tags = cached.get("tags", [])
+                country = cached.get("country", "")
+            elif isinstance(cached, list):
+                tags = cached
+                country = ""
+
+        # 3️⃣ If nothing cached, fetch from API and update cache
+        if not tags and isinstance(artist, str) and artist.strip():
+            info = self.api.fetch(artist, track)
+            if isinstance(info, dict):
+                tags = info.get("tags", [])
+                country = info.get("country", "")
+            elif isinstance(info, list):
+                tags = info
+                country = ""
+
+        # 4️⃣ Rule-based direct match still takes priority if strong
         match, conf = self.rule_match(genre)
         if conf >= 0.8:
-            return match, conf
+            return match, conf, bool(tags)
 
-        # 3. Internet enrichment (now returns tags, country)
-        tags, country = self.enrich(artist or "", track)
-
-        # --- Brazilian Funk disambiguation ---
-        g_clean = self.clean(genre)
+        # 5️⃣ Use enrichment info for smarter disambiguation
         looks_like_funk = bool(re.search(r"\bfunk\b", g_clean))
-        has_brfunk_tag = any(t in {"baile funk", "funk carioca", "funk br", "funk brasileiro", "mandelao", "proibidao", "funk ostentacao", "funk rave"} for t in tags)
+        has_brfunk_tag = any(
+            t in {"baile funk", "funk carioca", "funk br", "funk brasileiro", 
+                "mandelao", "proibidao", "funk ostentacao", "funk rave"}
+            for t in tags
+        )
         is_brazil = (country.upper() == "BR")
 
         if looks_like_funk:
             if has_brfunk_tag or is_brazil:
                 return "Brazilian Funk", 0.95
             else:
-                # classic/US Funk (leave as 'Funk' umbrella)
                 return "Funk", 0.90
 
-        # If not 'funk' ambiguity, but we have tags → try semantic on tags
+        # 6️⃣ If we have any tags → semantic match on tags
         if tags:
             match, conf = self.semantic_match(tags)
             if conf >= 0.6:
-                return match, conf
+                return match, conf, bool(tags)
 
-
-        # 4. Fallback: direct semantic
+        # 7️⃣ Fallback: semantic match on raw genre text
         match, conf = self.semantic_match(genre)
-        return match, conf
+        return match, conf, bool(tags)
+
 
     # ------------------------------------------
     # Batch mode
@@ -265,7 +319,7 @@ class GenreClassifier:
             genre = row.get(col_genre, "")
             artist = row.get(col_artist, "")
             track = row.get(col_track, "")
-            g, conf = self.classify(genre, artist, track)
+            g, conf, used_cache = self.classify(genre, artist, track)
 
             # get cached country if exists
             country = ""
@@ -278,7 +332,8 @@ class GenreClassifier:
                 "Original": genre,
                 "Suggested": g,
                 "Confidence": conf,
-                "country": country
+                "country": country,
+                "UsedCache": used_cache
             })
         return pd.DataFrame(results)
 
