@@ -14,7 +14,7 @@ import re
 import json
 import time
 import requests
-import pandas as pdok
+import pandas as pd
 import numpy as np
 from pathlib import Path
 from unidecode import unidecode
@@ -32,7 +32,7 @@ UMBRELLA_GENRES = [
     "Metal", "R&B/Soul", "Indie Pop", "Worldwide",
     "Comedy", "Soundtrack", "Singer/Songwriter", "Latin",
     "Trance", "Folk", "Holiday", "Techno", "Country",
-    "Reggae", "Soul", "Funk", "Dubstep", "K-Pop", "Punjabi"
+    "Reggae", "Soul", "Funk", "Dubstep", "K-Pop", "Punjabi","Brazilian Funk"
 ]
 
 # ==========================================================
@@ -55,7 +55,7 @@ RULES = {
     r"\bpop latino|latino\b": "Latin",
     r"\blatin\b": "Latin",
     r"\bmpb\b": "MPB",
-    r"\bbossa nova|samba|pagode|sertanejo|baile funk\b": "Brazilian",
+    r"\bbossa nova|samba|pagode|sertanejo|": "Brazilian",
     r"\bbrasileir|brazilian\b": "Brazilian",
     r"\br&b|rnb|soul\b": "R&B/Soul",
     r"\bfolk\b": "Folk",
@@ -68,7 +68,15 @@ RULES = {
     r"\bsinger|songwriter\b": "Singer/Songwriter",
     r"\bholiday|natal\b": "Holiday",
     r"\bk[- ]?pop\b": "K-Pop",
-    r"\bpunjabi\b": "Punjabi"
+    r"\bpunjabi\b": "Punjabi",
+    r"\bbaile\s*funk\b": "Brazilian Funk",
+    r"\bfunk\s*carioca\b": "Brazilian Funk",
+    r"\bfunk\s*br(?:asileiro)?\b": "Brazilian Funk",
+    r"\bmandel[aã]o\b": "Brazilian Funk",
+    r"\bproibidao\b": "Brazilian Funk",
+    r"\bfunk\s*ostent[aã]o\b": "Brazilian Funk",
+    r"\bfunk\s*rave\b": "Brazilian Funk"
+
 }
 
 # ==========================================================
@@ -103,9 +111,12 @@ class APIFetcher:
                 data = resp.json()
                 if data.get("artists"):
                     first = data["artists"][0]
+                    country = first.get("country", "")  # + capture country
                     if "tags" in first:
                         tags.extend([t["name"] for t in first["tags"]])
         except Exception:
+            country = ""  # + ensure defined on exceptions
+
             pass
 
         # --- Last.fm ---
@@ -115,6 +126,7 @@ class APIFetcher:
                 params = {
                     "method": "artist.gettoptags",
                     "artist": artist,
+                    "country": country,
                     "api_key": self.lastfm_key,
                     "format": "json"
                 }
@@ -126,7 +138,7 @@ class APIFetcher:
                 pass
 
         tags = list(set(tags))
-        self.cache[key] = tags
+        self.cache[key] = {"tags": list(set(tags)), "country": country}
         self.save_cache()
         time.sleep(1.0)  # be polite
         return tags
@@ -174,8 +186,18 @@ class GenreClassifier:
     # Internet enrichment
     # ------------------------------------------
     def enrich(self, artist, track=None):
-        tags = self.api.fetch(artist, track)
-        return [self.clean(t) for t in tags if isinstance(t, str)]
+        if not isinstance(artist, str) or not artist.strip():
+            return [], ""
+        info = self.api.fetch(artist, track)
+        if isinstance(info, dict):
+            tags = info.get("tags", [])
+            country = info.get("country", "")
+        else:
+            # backward-compat if cache has old shape (list)
+            tags, country = info, ""
+        clean_tags = [self.clean(t) for t in tags if isinstance(t, str)]
+        return clean_tags, (country or "")
+
 
     # ------------------------------------------
     # Embedding-based semantic match
@@ -207,12 +229,28 @@ class GenreClassifier:
         if conf >= 0.8:
             return match, conf
 
-        # 3. Internet enrichment
-        tags = self.enrich(artist or "", track)
+        # 3. Internet enrichment (now returns tags, country)
+        tags, country = self.enrich(artist or "", track)
+
+        # --- Brazilian Funk disambiguation ---
+        g_clean = self.clean(genre)
+        looks_like_funk = bool(re.search(r"\bfunk\b", g_clean))
+        has_brfunk_tag = any(t in {"baile funk", "funk carioca", "funk br", "funk brasileiro", "mandelao", "proibidao", "funk ostentacao", "funk rave"} for t in tags)
+        is_brazil = (country.upper() == "BR")
+
+        if looks_like_funk:
+            if has_brfunk_tag or is_brazil:
+                return "Brazilian Funk", 0.95
+            else:
+                # classic/US Funk (leave as 'Funk' umbrella)
+                return "Funk", 0.90
+
+        # If not 'funk' ambiguity, but we have tags → try semantic on tags
         if tags:
             match, conf = self.semantic_match(tags)
             if conf >= 0.6:
                 return match, conf
+
 
         # 4. Fallback: direct semantic
         match, conf = self.semantic_match(genre)
@@ -228,8 +266,22 @@ class GenreClassifier:
             artist = row.get(col_artist, "")
             track = row.get(col_track, "")
             g, conf = self.classify(genre, artist, track)
-            results.append({"Original": genre, "Suggested": g, "Confidence": conf})
+
+            # get cached country if exists
+            country = ""
+            key = f"{str(artist).lower()}::{str(track).lower() if track else ''}"
+            info = self.api.cache.get(key)
+            if isinstance(info, dict):
+                country = info.get("country", "")
+
+            results.append({
+                "Original": genre,
+                "Suggested": g,
+                "Confidence": conf,
+                "country": country
+            })
         return pd.DataFrame(results)
+
 
     # ------------------------------------------
     # Manual learning update
@@ -238,10 +290,53 @@ class GenreClassifier:
         self.manual_map[original] = corrected
         print(f"✅ Learned mapping: '{original}' → '{corrected}'")
 
-# ==========================================================
-# Usage example
-# ==========================================================
+# df = pd.read_csv("data/library_clean.csv")
+
+# # Show how many NaNs each key column has
+# print("\n🔍 Missing values per column:")
+# print(df[["Name", "Artist", "Genre"]].isna().sum())
+
+# # See a few rows with missing artist or genre
+# print("\n🎵 Rows with missing Artist or Genre:")
+# print(df[df["Artist"].isna() | df["Genre"].isna()][["Name", "Artist", "Genre"]].head(10))
+
+# # Optional: check if Artist column has non-strings (numbers or floats)
+# non_str = df[~df["Artist"].apply(lambda x: isinstance(x, str))]
+# print(f"\n⚠️ Non-string Artist entries: {len(non_str)}")
+# if len(non_str):
+#     print(non_str[["Name", "Artist"]].head(10))
+
+
 if __name__ == "__main__":
     clf = GenreClassifier()
     print("Example:", clf.classify("Hip Hop"))
     print("Example:", clf.classify("Eletrônica", artist="Alok"))
+
+
+
+
+
+
+# ==========================================================
+# 🧩 APPLY CLASSIFIER TO FULL LIBRARY
+# ==========================================================
+if Path("data/library_clean.csv").exists():
+    print("\n🚀 Running genre normalization on library_clean.csv ...")
+
+    df = pd.read_csv("data/library_clean.csv")
+    clf = GenreClassifier()
+
+    print(f"Loaded {len(df)} tracks from cleaned library.")
+    results = clf.classify_dataframe(df)
+
+    df["Genre_norm"] = results["Suggested"]
+    df["Confidence"] = results["Confidence"]
+
+    out_path = Path("data/library_classified.csv")
+    out_path.parent.mkdir(exist_ok=True, parents=True)
+    df.to_csv(out_path, index=False)
+
+    print(f"\n✅ Classified library saved to {out_path.resolve()}")
+    print(df[["Genre", "Genre_norm", "Confidence"]].head(10))
+else:
+    print("\n⚠️ No 'data/library_clean.csv' found — run load.py first.")

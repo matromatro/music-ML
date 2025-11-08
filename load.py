@@ -1,4 +1,4 @@
-import plistlib, pandas as pd, numpy as np
+import plistlib, pandas as pd, numpy as np, matplotlib.pyplot as plt
 from pathlib import Path
 
 # --- Load Biblioteca export (plist) ---
@@ -73,7 +73,30 @@ play_gain = (df['plays'].fillna(0))**0.7
 
 df['preference_score'] = (0.7*play_gain*recency - 0.3*skip_penalty + 0.8*loved_bonus)
 df['preference_score'] = df['preference_score'].fillna(df['preference_score'].median())
-df = df[~((df["Name"] == "Nova Gravação") & (df["Artist"] == "iPhone de Henrique"))]
+
+# ==========================================================
+# 🧹 REMOVE INVALID / SPECIFIC ROWS
+# ==========================================================
+invalid_names = [
+    "Henrique Mat 7 Maio",
+    "IA PHY F 257",
+    "IA PHY F 256",
+    "IA PHY F 320",
+    "PHY IA F 384",
+    "IA phy f 480",
+    "Esponja f1"
+]
+
+before = len(df)
+
+# 1️⃣ Remove the "Nova Gravação" dummy voice memo
+df = df[~((df["Artist"] == "iPhone de Henrique"))]
+
+# 2️⃣ Remove the known invalid rows by name
+df = df[~df["Name"].isin(invalid_names)].copy()
+
+
+
 
 
 print("Rows:", len(df))
@@ -81,7 +104,7 @@ print("Top columns:", df.columns.tolist()[:10], "…")
 print(df[['Name','Artist','Genre','Play Count','Skip Count','Date Added','Play Date UTC','preference_score']].head(10))
 
 
-import matplotlib.pyplot as plt
+
 
 # Top genres by play count
 top_genres = (
@@ -125,3 +148,11 @@ plt.ylabel("Total Plays")
 plt.xlabel("Artist")
 plt.tight_layout()
 plt.show()
+
+# ==========================================================
+# 📦 EXPORT CLEAN DATA
+# ==========================================================
+out_path = Path("data") / "library_clean.csv"
+out_path.parent.mkdir(exist_ok=True, parents=True)
+df.to_csv(out_path, index=False)
+print(f"\n✅ Clean library exported to {out_path.resolve()}")
