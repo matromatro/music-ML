@@ -96,6 +96,62 @@ df = df[~((df["Artist"] == "iPhone de Henrique"))]
 df = df[~df["Name"].isin(invalid_names)].copy()
 
 
+# ==========================================================
+# 🌍 EXTERNAL SOURCES (SoundCloud / Shazam)
+# ==========================================================
+def load_external(path_str, source_name, col_map):
+    p = Path(path_str)
+    if not p.exists():
+        print(f"ℹ️  No external data found at {p}, skipping {source_name}.")
+        return pd.DataFrame()
+    
+    try:
+        ext = pd.read_csv(p)
+        # Rename columns to match core schema
+        ext = ext.rename(columns=col_map)
+        
+        # Add missing core cols
+        for c in ['Genre', 'Album', 'Play Count', 'Skip Count', 'Loved']:
+            if c not in ext.columns:
+                ext[c] = np.nan
+                
+        # Fill defaults
+        ext['Source'] = source_name
+        ext['Play Count'] = ext['Play Count'].fillna(1) # assume at least 1 play
+        
+        # Keep only relevant
+        keep_cols = [c for c in df.columns if c in ext.columns] + ['Source']
+        return ext[keep_cols]
+    except Exception as e:
+        print(f"⚠️ Error loading {source_name}: {e}")
+        return pd.DataFrame()
+
+# SoundCloud Schema Map (Standard export headers -> Our Schema)
+sc_map = {
+    "Title": "Name", 
+    "User": "Artist", 
+    "Created At": "Date Added"
+}
+
+# Shazam Schema Map (Standard export headers -> Our Schema)
+shz_map = {
+    "Title": "Name", 
+    "Artist": "Artist", 
+    "Date Saved": "Date Added"
+}
+
+df_sc = load_external("data/external/soundcloud_likes.csv", "SoundCloud", sc_map)
+df_sh = load_external("data/external/shazam_history.csv", "Shazam", shz_map)
+
+# Default main source
+df['Source'] = 'Apple'
+
+# Merge all
+df = pd.concat([df, df_sc, df_sh], ignore_index=True)
+
+print(f"Start rows: {before} | Apple: {len(df[df['Source']=='Apple'])} | SC: {len(df_sc)} | Shazam: {len(df_sh)} | Total: {len(df)}")
+
+
 
 
 
